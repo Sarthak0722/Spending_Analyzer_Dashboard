@@ -174,6 +174,22 @@ if uploaded_file:
                             """, unsafe_allow_html=True)
 
             with tab1:
+                # --- Date Range Filter ---
+                min_date = df['timestamp'].dt.date.min()
+                max_date = df['timestamp'].dt.date.max()
+                date_range = st.date_input(
+                    "Select date range",
+                    value=(min_date, max_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                    key="date_range_filter"
+                )
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_date, end_date = date_range
+                else:
+                    start_date, end_date = min_date, max_date
+                filtered_df = df[(df['timestamp'].dt.date >= start_date) & (df['timestamp'].dt.date <= end_date)]
+
                 col1, col2 = st.columns([3, 1])
                 with col2:
                     selection = st.radio("Choose Visualization", [
@@ -185,44 +201,52 @@ if uploaded_file:
                 with col1:
                     if selection == "📂 Category":
                         header_with_info_inline("Category-wise Spending", "Shows your spending distribution across categories.")
-                        st.plotly_chart(px.pie(df, names='category', values='amount'), use_container_width=True)
+                        st.plotly_chart(px.pie(filtered_df, names='category', values='amount'), use_container_width=True)
                     elif selection == "🏪 Top Merchants":
                         header_with_info_inline("Top 10 Merchants by Spend", "Merchants where you spend the most money.")
-                        st.plotly_chart(px.bar(top_merchants, x='merchant', y='amount'), use_container_width=True)
+                        top_merchants_f = filtered_df.groupby('merchant')['amount'].sum().sort_values(ascending=False).head(10).reset_index()
+                        st.plotly_chart(px.bar(top_merchants_f, x='merchant', y='amount'), use_container_width=True)
                     elif selection == "🌆 Top Cities":
                         header_with_info_inline("Top Cities by Spending", "Cities where your transactions mostly happen.")
-                        st.plotly_chart(px.bar(top_cities, x='city', y='amount'), use_container_width=True)
+                        top_cities_f = filtered_df.groupby('city')['amount'].sum().sort_values(ascending=False).head(10).reset_index()
+                        st.plotly_chart(px.bar(top_cities_f, x='city', y='amount'), use_container_width=True)
                     elif selection == "📅 Monthly Trends":
                         header_with_info_inline("Monthly Spending Trend", "Line chart showing your total monthly spend.")
-                        st.plotly_chart(px.line(monthly, x='month', y='amount'), use_container_width=True)
+                        monthly_f = filtered_df.groupby('month')['amount'].sum().reset_index()
+                        st.plotly_chart(px.line(monthly_f, x='month', y='amount'), use_container_width=True)
                     elif selection == "📈 Heatmap":
                         # Heatmap Visualization and Auto Explanation
                         header_with_info_inline("Weekly Spending Heatmap", "Shows your spending intensity by weekday and hour.")
+                        heatmap_data_f = filtered_df.groupby(['day', 'hour'])['amount'].sum().unstack().fillna(0)
                         fig, ax = plt.subplots(figsize=(10, 4))
-                        sns.heatmap(heatmap_data, cmap="YlGnBu", ax=ax)
+                        sns.heatmap(heatmap_data_f, cmap="YlGnBu", ax=ax)
                         st.pyplot(fig)
 
                         # Generate insights dynamically
-                        peak_day_heat = heatmap_data.sum(axis=1).idxmax()
-                        peak_hour_heat = heatmap_data.sum(axis=0).idxmax()
-                        heat_amt = int(heatmap_data.loc[peak_day_heat, peak_hour_heat])
-                        st.markdown(f"""
-                        <div style="margin-bottom: 16px; font-size: 15px; color: #f9f9f9;">
-                        📌 Based on the heatmap, your highest spending typically occurs on <b>{peak_day_heat}</b> around <b>{peak_hour_heat}:00</b> hours, with total spending reaching <b>₹{heat_amt}</b> during that time slot.
-                        </div>
-                        """, unsafe_allow_html=True)
+                        if not heatmap_data_f.empty:
+                            peak_day_heat = heatmap_data_f.sum(axis=1).idxmax()
+                            peak_hour_heat = heatmap_data_f.sum(axis=0).idxmax()
+                            heat_amt = int(heatmap_data_f.loc[peak_day_heat, peak_hour_heat])
+                            st.markdown(f"""
+                            <div style="margin-bottom: 16px; font-size: 15px; color: #f9f9f9;">
+                            📌 Based on the heatmap, your highest spending typically occurs on <b>{peak_day_heat}</b> around <b>{peak_hour_heat}:00</b> hours, with total spending reaching <b>₹{heat_amt}</b> during that time slot.
+                            </div>
+                            """, unsafe_allow_html=True)
 
                     elif selection == "📉 Daily Trends":
                         header_with_info_inline("Daily Spending Trend", "Line chart showing daily total spending over time.")
-                        st.plotly_chart(px.line(daily, x='date', y='amount'), use_container_width=True)
+                        daily_f = filtered_df.groupby('date')['amount'].sum().reset_index()
+                        st.plotly_chart(px.line(daily_f, x='date', y='amount'), use_container_width=True)
                     
                     elif selection == "🕒 Hourly Spend":
                         header_with_info_inline("Spending by Hour", "How your spending varies across hours of the day.")
-                        st.plotly_chart(px.bar(hourly, x='hour', y='amount'), use_container_width=True)
+                        hourly_f = filtered_df.groupby('hour')['amount'].sum().reset_index()
+                        st.plotly_chart(px.bar(hourly_f, x='hour', y='amount'), use_container_width=True)
 
                     elif selection == "🗓️ Weekly Category":
                         header_with_info_inline("Category-wise Weekly Spending", "Stacked bar showing each category's spend across weekdays.")
-                        st.plotly_chart(px.bar(weekly_cat, x='day', y='amount', color='category', barmode='stack'), use_container_width=True)
+                        weekly_cat_f = filtered_df.groupby(['day', 'category'])['amount'].sum().reset_index()
+                        st.plotly_chart(px.bar(weekly_cat_f, x='day', y='amount', color='category', barmode='stack'), use_container_width=True)
 
             with tab2:
                 with st.expander("🔁 Double Payments"):
