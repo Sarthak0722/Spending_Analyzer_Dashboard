@@ -7,6 +7,11 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 import requests
+from sqlalchemy import create_engine
+import sqlite3
+import time as time_module
+import subprocess
+from streamlit_autorefresh import st_autorefresh
 
 # --- Setup ---
 load_dotenv()
@@ -20,7 +25,18 @@ RECHARGE_VALIDITY = {
 st.set_page_config(page_title="Spending Anomaly Dashboard", layout="wide")
 st.title("📊 Spending Anomaly Dashboard")
 
-uploaded_file = st.file_uploader("📂 Upload your transaction CSV", type=['csv'])
+# --- Data Source Selection ---
+data_source = st.radio(
+    "Select data source:",
+    ["Upload CSV", "Connect to UPI (dummy simulation)"],
+    horizontal=True
+)
+
+uploaded_file = None
+sim_db_path = "../simulated_transactions.db" if not os.path.exists("simulated_transactions.db") else "simulated_transactions.db"
+
+if data_source == "Upload CSV":
+    uploaded_file = st.file_uploader("📂 Upload your transaction CSV", type=['csv'])
 
 REQUIRED_COLUMNS = {'date', 'time', 'amount', 'merchant', 'txn_type', 'category', 'city'}
 
@@ -90,90 +106,152 @@ def header_with_info_inline(title, explanation):
     )
 
 # === Main Flow ===
-if uploaded_file:
+if 'upi_sim_initialized' not in st.session_state:
+    st.session_state['upi_sim_initialized'] = False
+
+if data_source == "Connect to UPI (dummy simulation)" and not st.session_state['upi_sim_initialized']:
+    # Clean the database (delete all transactions)
     try:
-        df = pd.read_csv(uploaded_file)
+        conn = sqlite3.connect(sim_db_path)
+        c = conn.cursor()
+        c.execute("DELETE FROM transactions")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        st.warning(f"Could not clean the database: {e}")
+
+    # Start the simulator in the background if not already running
+    import psutil
+    import sys
+    simulator_running = False
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if 'upi_simulator.py' in ' '.join(proc.info['cmdline']):
+                simulator_running = True
+                break
+        except Exception:
+            continue
+    if not simulator_running:
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(os.path.join(os.path.dirname(__file__), '../upi_simulator.py'))])
+            st.success("Started UPI simulator in the background.")
+        except Exception as e:
+            st.error(f"Failed to start UPI simulator: {e}")
+    st.session_state['upi_sim_initialized'] = True
+
+if data_source != "Connect to UPI (dummy simulation)":
+    st.session_state['upi_sim_initialized'] = False
+
+refresh = False
+if data_source == "Connect to UPI (dummy simulation)":
+    refresh = st.button("🔄 Refresh transactions", help="Click to manually refresh the dashboard with the latest transactions.")
+    if refresh:
+        st.rerun()
+
+if (data_source == "Upload CSV" and uploaded_file) or (data_source == "Connect to UPI (dummy simulation)"):
+    try:
+        if data_source == "Upload CSV":
+            df = pd.read_csv(uploaded_file)
+        else:
+            # --- Fetch from SQLite simulation ---
+            engine = create_engine(f'sqlite:///{sim_db_path}')
+            df = pd.read_sql("SELECT * FROM transactions", engine)
 
         # === Check Format ===
         uploaded_columns = set(df.columns)
         missing_cols = REQUIRED_COLUMNS - uploaded_columns
         if missing_cols:
-            st.error(f"❌Wrong CSV file format. Please check the correct CSV format. Missing required columns: {', '.join(missing_cols)}")
+            st.warning(f"Waiting for transactions... (Missing columns: {', '.join(missing_cols)})")
+            for col in REQUIRED_COLUMNS:
+                if col not in df.columns:
+                    df[col] = []
         else:
             df['timestamp'] = pd.to_datetime(df['date'] + ' ' + df['time'])
-
-            # Run all detectors
-            duplicates = detect_duplicates(df)
-            spikes = detect_spikes(df)
-            out_city = detect_out_of_city(df)
-            current_recharges = detect_all_current_recharges(df)
-
-            # Preprocessing for visualizations
             df['month'] = pd.to_datetime(df['date']).dt.to_period('M').astype(str)
             df['day'] = pd.to_datetime(df['date']).dt.day_name()
             df['hour'] = pd.to_datetime(df['time']).dt.hour
-            txn_counts = df.groupby('amount').size().reset_index(name='count')
-            top_merchants = df.groupby('merchant')['amount'].sum().sort_values(ascending=False).head(10).reset_index()
-            top_cities = df.groupby('city')['amount'].sum().sort_values(ascending=False).head(10).reset_index()
-            monthly = df.groupby('month')['amount'].sum().reset_index()
-            heatmap_data = df.groupby(['day', 'hour'])['amount'].sum().unstack().fillna(0)
-            daily = df.groupby('date')['amount'].sum().reset_index()
-            hourly = df.groupby('hour')['amount'].sum().reset_index()
-            weekly_cat = df.groupby(['day', 'category'])['amount'].sum().reset_index()
 
-            # Extracting Insights
+        # Run all detectors (handle empty df gracefully)
+        duplicates = detect_duplicates(df) if not df.empty else pd.DataFrame()
+        spikes = detect_spikes(df) if not df.empty else pd.DataFrame()
+        out_city = detect_out_of_city(df) if not df.empty else pd.DataFrame()
+        current_recharges = detect_all_current_recharges(df) if not df.empty else pd.DataFrame()
+
+        # Preprocessing for visualizations (handle empty df)
+        txn_counts = df.groupby('amount').size().reset_index(name='count') if not df.empty else pd.DataFrame()
+        top_merchants = df.groupby('merchant')['amount'].sum().sort_values(ascending=False).head(10).reset_index() if not df.empty else pd.DataFrame()
+        top_cities = df.groupby('city')['amount'].sum().sort_values(ascending=False).head(10).reset_index() if not df.empty else pd.DataFrame()
+        monthly = df.groupby('month')['amount'].sum().reset_index() if not df.empty else pd.DataFrame()
+        heatmap_data = df.groupby(['day', 'hour'])['amount'].sum().unstack().fillna(0) if not df.empty else pd.DataFrame()
+        daily = df.groupby('date')['amount'].sum().reset_index() if not df.empty else pd.DataFrame()
+        hourly = df.groupby('hour')['amount'].sum().reset_index() if not df.empty else pd.DataFrame()
+        weekly_cat = df.groupby(['day', 'category'])['amount'].sum().reset_index() if not df.empty else pd.DataFrame()
+
+        # Extracting Insights (handle empty df)
+        if not df.empty:
             top_cat = df.groupby('category')['amount'].sum().idxmax()
             cat_amt = df.groupby('category')['amount'].sum().max()
             total_amt = df['amount'].sum()
-            top_merchant = top_merchants.iloc[0]['merchant']
-            merchant_amt = int(top_merchants.iloc[0]['amount'])
-            top_city = top_cities.iloc[0]['city']
-            city_amt = int(top_cities.iloc[0]['amount'])
-            highest_month = monthly.loc[monthly['amount'].idxmax()]
-            peak_day = heatmap_data.sum(axis=1).idxmax()
-            peak_hour = heatmap_data.sum(axis=0).idxmax()
-            common_amt = txn_counts.loc[txn_counts['count'].idxmax(), 'amount']
-
+            top_merchant = top_merchants.iloc[0]['merchant'] if not top_merchants.empty else "-"
+            merchant_amt = int(top_merchants.iloc[0]['amount']) if not top_merchants.empty else 0
+            top_city = top_cities.iloc[0]['city'] if not top_cities.empty else "-"
+            city_amt = int(top_cities.iloc[0]['amount']) if not top_cities.empty else 0
+            highest_month = monthly.loc[monthly['amount'].idxmax()] if not monthly.empty else {"month": "-", "amount": 0}
+            peak_day = heatmap_data.sum(axis=1).idxmax() if not heatmap_data.empty else "-"
+            peak_hour = heatmap_data.sum(axis=0).idxmax() if not heatmap_data.empty else "-"
+            common_amt = txn_counts.loc[txn_counts['count'].idxmax(), 'amount'] if not txn_counts.empty else "-"
             insights = [
-                ("💼 Top Category", f"{top_cat} ({(cat_amt/total_amt)*100:.1f}%)"),
+                ("💼 Top Category", f"{top_cat} ({(cat_amt/total_amt)*100:.1f}%)" if total_amt else "-"),
                 ("🏪 Top Merchant", f"{top_merchant} (₹{merchant_amt})"),
                 ("🌆 Top City", f"{top_city} (₹{city_amt})"),
-                ("📅 Peak Month", f"{highest_month['month']} (₹{int(highest_month['amount'])})"),
+                ("📅 Peak Month", f"{highest_month['month']} (₹{int(highest_month['amount'])})" if not monthly.empty else "-"),
                 ("🕒 Peak Time", f"{peak_day}s at {peak_hour}:00"),
                 ("💸 Common Amount", f"₹{common_amt}"),
             ]
+        else:
+            insights = [
+                ("💼 Top Category", "-"),
+                ("🏪 Top Merchant", "-"),
+                ("🌆 Top City", "-"),
+                ("📅 Peak Month", "-"),
+                ("🕒 Peak Time", "-"),
+                ("💸 Common Amount", "-"),
+            ]
 
-            # Tabs UI
-            tab0, tab1, tab2, tab3, tab4 = st.tabs([
-                "🧠 Summary", "📊 Visualizations", "🚨 Anomalies", "📅 Active Plans", "💬 Chatbot"
-            ])
+        # Tabs UI (always show tabs)
+        tab0, tab1, tab2, tab3, tab4 = st.tabs([
+            "🧠 Summary", "📊 Visualizations", "🚨 Anomalies", "📅 Active Plans", "💬 Chatbot"
+        ])
 
-            with tab0:
-                card_chunks = [insights[i:i+3] for i in range(0, len(insights), 3)]
-                for row in card_chunks:
-                    cols = st.columns(len(row))
-                    for col, (label, value) in zip(cols, row):
-                        with col:
-                            st.markdown(f"""
-                                <div style="
-                                    background-color: #f9f9f9;
-                                    padding: 14px 18px;
-                                    border-radius: 12px;
-                                    text-align: center;
-                                    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
-                                    height: 100px;
-                                    display: flex;
-                                    flex-direction: column;
-                                    justify: center;
-                                    align-items: center;
-                                    margin: 6px 6px 12px 6px;
-                                ">
-                                    <div style="font-size: 16px; font-weight: 700; color: #222;">{label}</div>
-                                    <div style="font-size: 18px; font-weight: 600; color: #111;">{value}</div>
-                                </div>
-                            """, unsafe_allow_html=True)
+        with tab0:
+            card_chunks = [insights[i:i+3] for i in range(0, len(insights), 3)]
+            for row in card_chunks:
+                cols = st.columns(len(row))
+                for col, (label, value) in zip(cols, row):
+                    with col:
+                        st.markdown(f"""
+                            <div style="
+                                background-color: #f9f9f9;
+                                padding: 14px 18px;
+                                border-radius: 12px;
+                                text-align: center;
+                                box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+                                height: 100px;
+                                display: flex;
+                                flex-direction: column;
+                                justify: center;
+                                align-items: center;
+                                margin: 6px 6px 12px 6px;
+                            ">
+                                <div style="font-size: 16px; font-weight: 700; color: #222;">{label}</div>
+                                <div style="font-size: 18px; font-weight: 600; color: #111;">{value}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
 
-            with tab1:
+        with tab1:
+            if df.empty:
+                st.info("No transactions yet. Visualizations will appear as soon as transactions are generated.")
+            else:
                 # --- Date Range Filter ---
                 min_date = df['timestamp'].dt.date.min()
                 max_date = df['timestamp'].dt.date.max()
@@ -248,53 +326,61 @@ if uploaded_file:
                         weekly_cat_f = filtered_df.groupby(['day', 'category'])['amount'].sum().reset_index()
                         st.plotly_chart(px.bar(weekly_cat_f, x='day', y='amount', color='category', barmode='stack'), use_container_width=True)
 
-            with tab2:
-                with st.expander("🔁 Double Payments"):
-                    st.markdown("**Why this matters:** These could be accidental repeat payments or system errors.")
-                    st.dataframe(duplicates)
+        with tab2:
+            with st.expander("🔁 Double Payments"):
+                st.markdown("**Why this matters:** These could be accidental repeat payments or system errors.")
+                st.dataframe(duplicates)
 
-                with st.expander("💥 Spending Spikes"):
-                    st.markdown("**Why this matters:** Unusually large amounts could indicate emergencies or fraud.")
-                    st.dataframe(spikes)
+            with st.expander("💥 Spending Spikes"):
+                st.markdown("**Why this matters:** Unusually large amounts could indicate emergencies or fraud.")
+                st.dataframe(spikes)
 
-                with st.expander("🌍 Out-of-City Transactions"):
-                    st.markdown("**Why this matters:** Transactions outside your usual city may signal travel or unauthorized use.")
-                    st.dataframe(out_city)
+            with st.expander("🌍 Out-of-City Transactions"):
+                st.markdown("**Why this matters:** Transactions outside your usual city may signal travel or unauthorized use.")
+                st.dataframe(out_city)
 
-            with tab3:
-                if current_recharges.empty:
-                    st.warning("⚠️ No active recharges.")
+        with tab3:
+            if current_recharges.empty:
+                st.warning("⚠️ No active recharges.")
+            else:
+                st.dataframe(current_recharges)
+
+        with tab4:
+            st.header("💬 Chat with AI About Your Spending")
+            user_question = st.text_input("Ask any question:")
+            if user_question and OPENROUTER_API_KEY:
+                with st.spinner("🤖 Thinking..."):
+                    try:
+                        messages = [
+                            {"role": "system", "content": "You are a helpful financial assistant. Use the user's insights to answer clearly."},
+                            {"role": "user", "content": f"Here are my insights:\n{insights}\n\nQuestion: {user_question}"}
+                        ]
+                        headers = {
+                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                            "Content-Type": "application/json"
+                        }
+                        data = {
+                            "model": "deepseek/deepseek-r1:free",
+                            "messages": messages
+                        }
+                        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
+                        if response.status_code == 200:
+                            reply = response.json()['choices'][0]['message']['content']
+                            st.success(reply)
+                        else:
+                            st.error("OpenRouter API error: " + response.text)
+                    except Exception as e:
+                        st.error("❌ Something went wrong during chatbot interaction. Please try again.")
+            elif user_question:
+                st.warning("Please set your OPENROUTER_API_KEY in .env to enable chatbot.")
+
+        # After loading df from the database, show a compact transaction viewer
+        if data_source == "Connect to UPI (dummy simulation)":
+            with st.expander("Live UPI Transactions (latest on top)", expanded=False):
+                if not df.empty:
+                    st.dataframe(df.sort_values('timestamp', ascending=False).reset_index(drop=True), height=200, use_container_width=True)
                 else:
-                    st.dataframe(current_recharges)
-
-            with tab4:
-                st.header("💬 Chat with AI About Your Spending")
-                user_question = st.text_input("Ask any question:")
-                if user_question and OPENROUTER_API_KEY:
-                    with st.spinner("🤖 Thinking..."):
-                        try:
-                            messages = [
-                                {"role": "system", "content": "You are a helpful financial assistant. Use the user's insights to answer clearly."},
-                                {"role": "user", "content": f"Here are my insights:\n{insights}\n\nQuestion: {user_question}"}
-                            ]
-                            headers = {
-                                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                                "Content-Type": "application/json"
-                            }
-                            data = {
-                                "model": "deepseek/deepseek-r1:free",
-                                "messages": messages
-                            }
-                            response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
-                            if response.status_code == 200:
-                                reply = response.json()['choices'][0]['message']['content']
-                                st.success(reply)
-                            else:
-                                st.error("OpenRouter API error: " + response.text)
-                        except Exception as e:
-                            st.error("❌ Something went wrong during chatbot interaction. Please try again.")
-                elif user_question:
-                    st.warning("Please set your OPENROUTER_API_KEY in .env to enable chatbot.")
+                    st.info("No transactions yet.")
 
     except Exception as e:
         st.error("❌ Something went wrong while processing the file. Please check the format and try again.")
@@ -302,7 +388,7 @@ else:
     col1, col2 = st.columns([6, 1])
 
     with col1:
-        st.info("⬆️ Please upload a transaction CSV to begin.")
+        st.info("⬆️ Please upload a transaction CSV or connect to UPI simulation to begin.")
 
     with col2:
         with st.popover("🧾 Sample format"):
