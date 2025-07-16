@@ -1,0 +1,10 @@
+streamlit
+pandas
+matplotlib
+seaborn
+plotly
+python-dotenv
+sqlalchemy
+requests
+psutil
+sqlite3 
