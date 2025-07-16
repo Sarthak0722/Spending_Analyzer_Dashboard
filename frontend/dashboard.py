@@ -134,7 +134,7 @@ if data_source == "Connect to UPI (dummy simulation)" and not st.session_state['
     if not simulator_running:
         try:
             subprocess.Popen([sys.executable, os.path.abspath(os.path.join(os.path.dirname(__file__), '../upi_simulator.py'))])
-            st.success("Started UPI simulator in the background.")
+            st.success("Started UPI simulator in the background. Your transactions will be automatically fetched from your upi app. Please refesh to see latest transactions. For dummy purpose this will currently generate 1 transaction per 10 sec.")
         except Exception as e:
             st.error(f"Failed to start UPI simulator: {e}")
     st.session_state['upi_sim_initialized'] = True
