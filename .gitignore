@@ -1,3 +1,5 @@
+#database file
+simulated_transactions.db
 # Environment variables
 .env
 .env.local
